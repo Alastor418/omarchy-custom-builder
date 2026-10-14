@@ -10,13 +10,14 @@ from pathlib import Path
 try:
     from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                  QTabWidget, QLabel, QLineEdit, QPushButton, QTextEdit,
-                                 QComboBox, QCheckBox, QTreeView, QFileSystemModel,
+                                 QComboBox, QCheckBox, QTreeView,
                                  QSplitter, QProgressBar, QMessageBox, QFileDialog, QFormLayout, QDialog, QDialogButtonBox,
                                  QListWidget)
+    from PyQt6.QtGui import QFileSystemModel
     from PyQt6.QtCore import QThread, pyqtSignal, Qt, QProcess, QDir
     from PyQt6.QtGui import QColor, QPalette, QTextCharFormat, QFont
     HAS_GUI = True
-except ImportError:
+except ImportError as e:
     HAS_GUI = False
 
 WORK_DIR = Path.home() / "omarchy-work"
@@ -77,6 +78,9 @@ class OmarchyCustomStudioBackend:
             plymouth_dir = self.installer_dir / "default" / "usr" / "share" / "plymouth" / "themes" / "custom"
             plymouth_dir.mkdir(parents=True, exist_ok=True)
             (plymouth_dir / "custom.plymouth").write_text(f"[Plymouth Theme]\nName=Custom\nImageDir={plymouth}\n", encoding="utf-8")
+            plymouth_conf_dir = self.installer_dir / "default" / "etc" / "plymouth"
+            plymouth_conf_dir.mkdir(parents=True, exist_ok=True)
+            (plymouth_conf_dir / "plymouthd.conf").write_text("[Daemon]\nTheme=custom\n", encoding="utf-8")
 
         limine_bg = config.get("limine")
         if limine_bg:
@@ -91,10 +95,25 @@ class OmarchyCustomStudioBackend:
             (ff_dir / "logo.txt").write_text(fastfetch, encoding="utf-8")
             
         sddm = config.get("sddm")
-        if sddm:
-            sddm_dir = self.installer_dir / "default" / "usr" / "share" / "sddm" / "themes"
-            sddm_dir.mkdir(parents=True, exist_ok=True)
-            (sddm_dir / "theme.conf").write_text(f"[Theme]\nBackground={sddm}\n", encoding="utf-8")
+        sddm_autologin = config.get("sddm_autologin")
+
+        if sddm or sddm_autologin:
+            sddm_conf_dir = self.installer_dir / "default" / "etc" / "sddm.conf.d"
+            sddm_conf_dir.mkdir(parents=True, exist_ok=True)
+
+            autologin_str = ""
+            if sddm_autologin:
+                autologin_user = config.get("cidata", {}).get("username", "omarchy")
+                autologin_str = f"[Autologin]\nUser={autologin_user}\nSession=hyprland\n"
+
+            theme_str = ""
+            if sddm:
+                sddm_dir = self.installer_dir / "default" / "usr" / "share" / "sddm" / "themes" / "custom"
+                sddm_dir.mkdir(parents=True, exist_ok=True)
+                (sddm_dir / "theme.conf").write_text(f"[Theme]\nBackground={sddm}\n", encoding="utf-8")
+                theme_str = "[Theme]\nCurrent=custom\n"
+
+            (sddm_conf_dir / "custom.conf").write_text(f"{theme_str}{autologin_str}", encoding="utf-8")
             
         hyprlock = config.get("hyprlock")
         if hyprlock:
@@ -113,11 +132,21 @@ class OmarchyCustomStudioBackend:
         
         return removed_pkgs
 
-    def inject_custom_dotfiles_and_configs(self, dotfiles_map: dict[str, str]) -> None:
+    def inject_custom_dotfiles_and_configs(self, dotfiles_map: dict[str, str], permissions_map: dict[str, str] = None) -> None:
+        if permissions_map is None:
+            permissions_map = {}
         for rel_target, content in dotfiles_map.items():
             target_path = self.installer_dir / "default" / rel_target
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(content, encoding="utf-8")
+
+            # Apply chmod if requested
+            if rel_target in permissions_map:
+                try:
+                    mode = int(permissions_map[rel_target], 8)
+                    target_path.chmod(mode)
+                except ValueError:
+                    print(f"Ошибка: Неверный формат прав (chmod) для {rel_target}: {permissions_map[rel_target]}")
 
     def apply_hyprland_quickshell_theme(self, theme_config: dict) -> None:
         hypr_conf_path = self.installer_dir / "default" / "hypr" / "hyprland.conf"
@@ -184,6 +213,16 @@ keyboard:
                     text = text.replace(old_str, new_str)
                 target.write_text(text, encoding="utf-8")
 
+    def add_chroot_scripts(self, chroot_scripts: str) -> None:
+        if not chroot_scripts.strip():
+            return
+        chroot_script_path = self.installer_dir / "install" / "99-custom-chroot.sh"
+        chroot_script_path.parent.mkdir(parents=True, exist_ok=True)
+
+        content = f"#!/usr/bin/env bash\nset -e\n\n# Custom Chroot Post-Install Script\n{chroot_scripts}\n"
+        chroot_script_path.write_text(content, encoding="utf-8")
+        chroot_script_path.chmod(0o755)
+
     def smart_sanitizer(self, removed_packages: list[str]) -> None:
         dirs_to_check = [
             self.installer_dir / "install",
@@ -243,8 +282,7 @@ keyboard:
         if bin_script.exists():
             process.start(str(bin_script), ["--local-source", str(self.installer_dir)])
         else:
-            # mock for testing
-            process.start("echo", ["Mocking build..."])
+            process.start("echo", ["Ошибка: Скрипт сборки omarchy-iso-make не найден! Убедитесь, что репозиторий omarchy-iso клонирован корректно."])
         return process
 
 # --- GUI ---
@@ -333,12 +371,14 @@ if HAS_GUI:
             self.limine_input = QLineEdit()
             self.fastfetch_input = QTextEdit()
             self.sddm_input = QLineEdit()
+            self.sddm_autologin_cb = QCheckBox("Включить автовход (Autologin) в SDDM")
             self.hyprlock_input = QLineEdit()
             l.addRow("Имя ОС (/etc/os-release):", self.os_name_input)
             l.addRow("Имя хоста:", self.hostname_input)
             l.addRow("Plymouth (путь к фону):", self.plymouth_input)
             l.addRow("Limine (путь к обоям):", self.limine_input)
             l.addRow("SDDM (путь к фону):", self.sddm_input)
+            l.addRow("", self.sddm_autologin_cb)
             l.addRow("Hyprlock (путь к фону):", self.hyprlock_input)
             l.addRow("Fastfetch (ASCII art):", self.fastfetch_input)
             self.tabs.addTab(w, "Заставка, Загрузчик и Брендинг")
@@ -367,6 +407,12 @@ if HAS_GUI:
             self.dotfiles_input = QTextEdit()
             self.dotfiles_input.setPlaceholderText('{\n  ".config/kitty/kitty.conf": "font_size 12.0"\n}')
             l.addWidget(self.dotfiles_input)
+
+            l.addWidget(QLabel("Права на файлы (опционально, формат: путь -> 0755):"))
+            self.dotfiles_perms_input = QTextEdit()
+            self.dotfiles_perms_input.setPlaceholderText('{\n  ".local/bin/myscript.sh": "0755"\n}')
+            l.addWidget(self.dotfiles_perms_input)
+
             self.tabs.addTab(w, "Программы и Свои Конфиги")
 
         def init_tab3(self):
@@ -432,6 +478,12 @@ if HAS_GUI:
             add_patch_btn = QPushButton("Добавить правило замены")
             add_patch_btn.clicked.connect(self.add_patch)
             patches_layout.addWidget(add_patch_btn)
+
+            patches_layout.addWidget(QLabel("Custom Chroot Post-Install Scripts:"))
+            self.chroot_scripts_input = QTextEdit()
+            self.chroot_scripts_input.setPlaceholderText("# Команды, выполняемые в chroot-окружении после установки ОС\nchmod +x /usr/local/bin/script.sh")
+            patches_layout.addWidget(self.chroot_scripts_input)
+
             layout.addLayout(patches_layout)
             
             self.current_file = None
@@ -530,11 +582,13 @@ if HAS_GUI:
                 "plymouth": self.plymouth_input.text(),
                 "limine": self.limine_input.text(),
                 "sddm": self.sddm_input.text(),
+                "sddm_autologin": self.sddm_autologin_cb.isChecked(),
                 "hyprlock": self.hyprlock_input.text(),
                 "fastfetch": self.fastfetch_input.toPlainText(),
                 "base_only": self.base_only_cb.isChecked(),
                 "custom_pkgs": self.custom_pkgs_input.text(),
                 "dotfiles": self.dotfiles_input.toPlainText(),
+                "dotfiles_perms": self.dotfiles_perms_input.toPlainText(),
                 "gaps_in": self.gaps_in_input.text(),
                 "gaps_out": self.gaps_out_input.text(),
                 "rounding": self.rounding_input.text(),
@@ -546,6 +600,7 @@ if HAS_GUI:
                 "radius": self.qs_radius.text(),
                 "font": self.qs_font.text(),
                 "line_patches": self.line_patches,
+                "chroot_scripts": self.chroot_scripts_input.toPlainText(),
                 "cidata": {
                     "username": self.username_input.text(),
                     "password": self.password_input.text(),
@@ -561,12 +616,14 @@ if HAS_GUI:
             self.plymouth_input.setText(prof.get("plymouth", ""))
             self.limine_input.setText(prof.get("limine", ""))
             self.sddm_input.setText(prof.get("sddm", ""))
+            self.sddm_autologin_cb.setChecked(prof.get("sddm_autologin", False))
             self.hyprlock_input.setText(prof.get("hyprlock", ""))
             self.fastfetch_input.setPlainText(prof.get("fastfetch", ""))
             
             self.base_only_cb.setChecked(prof.get("base_only", False))
             self.custom_pkgs_input.setText(prof.get("custom_pkgs", ""))
             self.dotfiles_input.setPlainText(prof.get("dotfiles", ""))
+            self.dotfiles_perms_input.setPlainText(prof.get("dotfiles_perms", ""))
             
             self.gaps_in_input.setText(prof.get("gaps_in", "5"))
             self.gaps_out_input.setText(prof.get("gaps_out", "10"))
@@ -581,6 +638,7 @@ if HAS_GUI:
             self.qs_font.setText(prof.get("font", "JetBrains Mono"))
             
             self.line_patches = prof.get("line_patches", [])
+            self.chroot_scripts_input.setPlainText(prof.get("chroot_scripts", ""))
             self.update_patches_view()
             
             cidata = prof.get("cidata", {})
@@ -643,13 +701,17 @@ if HAS_GUI:
             
             try:
                 dotfiles = json.loads(prof["dotfiles"] or "{}")
-                self.backend.inject_custom_dotfiles_and_configs(dotfiles)
+                dotfiles_perms = json.loads(prof["dotfiles_perms"] or "{}")
+                self.backend.inject_custom_dotfiles_and_configs(dotfiles, dotfiles_perms)
             except Exception as e:
-                self.console.append(f"Ошибка в JSON конфигов: {e}")
+                self.console.append(f"Ошибка в JSON конфигов/прав: {e}")
                 
             self.console.append("Применение патчей строк...")
             self.backend.patch_system_lines(self.line_patches)
             
+            self.console.append("Добавление chroot-скриптов...")
+            self.backend.add_chroot_scripts(prof.get("chroot_scripts", ""))
+
             self.console.append("Генерация cidata автоустановки...")
             self.backend.generate_cidata(prof["cidata"])
             
@@ -680,10 +742,21 @@ if HAS_GUI:
         def test_qemu(self):
             iso = self.backend.iso_dir / "release" / "omarchy.iso"
             if not iso.exists():
-                self.console.append("ISO файл не найден.")
+                self.console.append("Ошибка: ISO файл не найден. Сначала выполните сборку (Собрать рабочий ISO).")
+                QMessageBox.critical(self, "Ошибка QEMU", "ISO файл не найден. Сначала выполните сборку (Собрать рабочий ISO).")
                 return
-            self.console.append("Запуск QEMU...")
-            subprocess.Popen(["qemu-system-x86_64", "-m", "2G", "-cdrom", str(iso)])
+
+            try:
+                self.console.append(f"Запуск QEMU для {iso}...")
+                subprocess.Popen(["qemu-system-x86_64", "-m", "2G", "-cdrom", str(iso)])
+            except FileNotFoundError:
+                msg = "Ошибка: qemu-system-x86_64 не найден. Установите QEMU (например, sudo pacman -S qemu-desktop)."
+                self.console.append(msg)
+                QMessageBox.critical(self, "Ошибка QEMU", msg)
+            except Exception as e:
+                msg = f"Произошла ошибка при запуске QEMU: {e}"
+                self.console.append(msg)
+                QMessageBox.critical(self, "Ошибка QEMU", msg)
 
 # --- TUI Fallback ---
 def run_tui():
@@ -694,7 +767,7 @@ def run_tui():
         backend.clone_sources()
         print("Готово.")
     except Exception as e:
-        print(f"Ошибка: {e}")
+        print(f"Критическая ошибка при клонировании исходников: {e}")
         return
     
     os_name = input("Имя ОС [Custom Omarchy]: ").strip() or "Custom Omarchy"
@@ -712,8 +785,12 @@ def run_tui():
     
     print("Запуск сборки ISO (может занять время)...")
     try:
-        iso_path = backend.build_iso()
-        print(f"ISO собран: {iso_path}")
+        bin_script = backend.iso_dir / "bin" / "omarchy-iso-make"
+        if bin_script.exists():
+            subprocess.run([str(bin_script), "--local-source", str(backend.installer_dir)], cwd=str(backend.iso_dir), check=True)
+            print(f"ISO собран: {backend.iso_dir / 'release' / 'omarchy.iso'}")
+        else:
+            print("Ошибка: Скрипт сборки omarchy-iso-make не найден!")
     except Exception as e:
         print(f"Ошибка сборки: {e}")
 

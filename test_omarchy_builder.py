@@ -33,7 +33,11 @@ def test_customize_splash_and_branding(backend):
     backend.customize_splash_and_branding({
         "os_name": "Test OS", 
         "hostname": "test-host",
-        "fastfetch": "fastfetch content"
+        "fastfetch": "fastfetch content",
+        "plymouth": "/path/to/plymouth",
+        "sddm": "/path/to/sddm_bg.png",
+        "sddm_autologin": True,
+        "cidata": {"username": "testuser"}
     })
     
     content = os_release_path.read_text()
@@ -44,6 +48,33 @@ def test_customize_splash_and_branding(backend):
     
     ff_path = backend.installer_dir / "default" / ".config" / "fastfetch" / "logo.txt"
     assert ff_path.read_text() == "fastfetch content"
+
+    plymouth_conf_path = backend.installer_dir / "default" / "etc" / "plymouth" / "plymouthd.conf"
+    assert "Theme=custom" in plymouth_conf_path.read_text()
+
+    sddm_conf_path = backend.installer_dir / "default" / "etc" / "sddm.conf.d" / "custom.conf"
+    sddm_content = sddm_conf_path.read_text()
+    assert "Current=custom" in sddm_content
+    assert "User=testuser" in sddm_content
+    assert "Session=hyprland" in sddm_content
+
+def test_inject_custom_dotfiles_and_configs(backend):
+    dotfiles = {".local/bin/script.sh": "echo test"}
+    perms = {".local/bin/script.sh": "0755"}
+    backend.inject_custom_dotfiles_and_configs(dotfiles, perms)
+
+    script_path = backend.installer_dir / "default" / ".local/bin/script.sh"
+    assert script_path.exists()
+    assert script_path.read_text() == "echo test"
+    # Ensure it's executable
+    assert os.access(script_path, os.X_OK)
+
+def test_add_chroot_scripts(backend):
+    backend.add_chroot_scripts("echo 'hello from chroot'")
+    chroot_script_path = backend.installer_dir / "install" / "99-custom-chroot.sh"
+    assert chroot_script_path.exists()
+    assert "hello from chroot" in chroot_script_path.read_text()
+    assert os.access(chroot_script_path, os.X_OK)
 
 def test_patch_system_lines(backend):
     test_file = backend.work_dir / "test.txt"
@@ -82,8 +113,9 @@ def test_check_syntax(backend):
     invalid_script.unlink()
     assert backend.check_syntax() == True
 
-@pytest.mark.skipif(not omarchy_builder.HAS_GUI, reason="Requires PyQt6")
 def test_gui_profile_export_import(tmp_path):
+    if not omarchy_builder.HAS_GUI:
+        pytest.skip("Requires PyQt6")
     from omarchy_builder import OmarchyApp, QApplication
     import sys
     
@@ -116,8 +148,9 @@ def test_gui_profile_export_import(tmp_path):
     assert window.base_only_cb.isChecked() == True
     assert window.custom_pkgs_input.text() == "vim htop"
 
-@pytest.mark.skipif(not omarchy_builder.HAS_GUI, reason="Requires PyQt6")
 def test_gui_startup():
+    if not omarchy_builder.HAS_GUI:
+        pytest.skip("Requires PyQt6")
     from omarchy_builder import OmarchyApp, QApplication
     import sys
     app = QApplication.instance()
